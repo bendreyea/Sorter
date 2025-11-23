@@ -120,17 +120,6 @@ App.Console.exe sort -i /Users/andrew/RiderProjects/test1.txt -o /Users/andrew/R
 App.Console.exe sort -i large_data.txt -o large_data_sorted.txt
 ```
 
-**Sorting Behavior:**
-```
-Input:                  Output (Sorted):
-5. Banana              3. Apple
-3. Apple               5. Banana
-12. Apple              12. Apple
-8. Cherry              8. Cherry
-```
-
----
-
 ---
 
 ## How It Works
@@ -278,15 +267,6 @@ The sorting logic uses a specialized comparator that handles the `<Number>. <Str
    - If strings match case-insensitively, lowercase comes before uppercase
 2. **Secondary Sort**: Numeric part (number before the period)
    - Ascending numerical order
-
-**Example:**
-```
-Input:           Sorted Output:
-5. Banana   →    3. apple
-3. Apple    →    3. Apple
-3. apple    →    5. Banana
-12. Apple   →    12. Apple
-```
 
 ---
 
