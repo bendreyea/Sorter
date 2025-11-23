@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <RootNamespace>App.ExternalSorter</RootNamespace>
+        <AssemblyName>App.ExternalSorter</AssemblyName>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+    <ItemGroup>
+      <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" />
+      <PackageReference Include="Microsoft.Extensions.Hosting"  />
+      <PackageReference Include="Microsoft.Extensions.Logging"  />
+    </ItemGroup>
+    <ItemGroup>
+      <ProjectReference Include="..\App.FileSystem\App.FileSystem.csproj" />
+    </ItemGroup>
+</Project>
