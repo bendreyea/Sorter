@@ -59,23 +59,59 @@ public class Sorter
         {
              SingleWriter = false,
              // Multiple consumers can read concurrently
-             SingleReader = true
+             SingleReader = false
         });
-        
-        string? finalSortedFile = null;
         
         // Start all tasks concurrently
         var splitterTask = SplitAndWriteToChannelAsync(inputFilePath, channelPartitioner.Writer, cancellationToken);
-        var producerTask = Producer(channelPartitioner.Reader, channelMerge.Writer,"Producer1", cancellationToken);
-        var consumerTask = Consumer(channelMerge.Reader, "Consumer", cancellationToken, mergedFile => finalSortedFile = mergedFile);
-        var producerTask2 = Producer(channelPartitioner.Reader, channelMerge.Writer,"Producer2", cancellationToken);
+        
+        var producers = new List<Task>();
+        int producerCount = _settings.MaxConcurrency;
+
+        for (int i = 0; i < producerCount; i++)
+        {
+            producers.Add(Producer(channelPartitioner.Reader, channelMerge.Writer, $"Producer{i+1}", cancellationToken));
+        }
+
+        var consumers = new List<Task<string?>>();
+        int consumerCount = _settings.MaxConcurrency;
+        for (int i = 0; i < consumerCount; i++)
+        {
+            consumers.Add(Consumer(channelMerge.Reader, $"Consumer{i+1}", cancellationToken));
+        }
 
         // Wait for splitter and producer to finish
-        await Task.WhenAll(splitterTask, producerTask, producerTask2).ConfigureAwait(false);
+        await splitterTask.ConfigureAwait(false);
+        await Task.WhenAll(producers).ConfigureAwait(false);
         channelMerge.Writer.Complete();
 
          // Wait for consumer to finish processing
-         await consumerTask.ConfigureAwait(false);
+         var consumerResults = await Task.WhenAll(consumers).ConfigureAwait(false);
+         
+         var finalFiles = consumerResults.Where(f => f != null).Cast<string>().ToList();
+         
+         string? finalSortedFile = null;
+         
+         if (finalFiles.Count == 0)
+         {
+             throw new InvalidOperationException("No sorted file was produced");
+         }
+         else if (finalFiles.Count == 1)
+         {
+             finalSortedFile = finalFiles[0];
+         }
+         else
+         {
+             // Final merge of the results from multiple consumers
+             _logger?.LogInformation("Performing final merge of {Count} files from consumers", finalFiles.Count);
+             finalSortedFile = await _merger.Merge(finalFiles, _comparer, cancellationToken).ConfigureAwait(false);
+             
+             // Cleanup intermediate files
+             foreach(var file in finalFiles)
+             {
+                 await _fileSystem.DeleteFileAsync(file, cancellationToken);
+             }
+         }
          
          // Move the final sorted file to the output location
          if (!string.IsNullOrEmpty(finalSortedFile))
@@ -106,38 +142,50 @@ public class Sorter
     }
 
     private async Task Producer(ChannelReader<string> reader, ChannelWriter<string> writer, string producerName, CancellationToken token)
-     {
-         var deleteFiles = new List<Task>();
-
-        // Iterate over the collection
-        await foreach (var item in reader.ReadAllAsync(token).ConfigureAwait(false))
+    {
+        var deleteFiles = new List<Task>();
+        
+        try
         {
-            token.ThrowIfCancellationRequested();
+            await foreach (var item in reader.ReadAllAsync(token).ConfigureAwait(false))
+            {
+                token.ThrowIfCancellationRequested();
+                
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                _logger?.LogInformation("{Producer}: Sorting chunk file: {Filename}", producerName, item);
+                
+                var sortedFilename = item.Replace(Constants.UnsortedFileExtension, Constants.SortedFileExtension);
+                var unsortedFilePath = GetFullPath(item);
+                var sortedFilePath = GetFullPath(sortedFilename);
+                
+                await _memoryFileSorter.SortFileAsync(unsortedFilePath, sortedFilePath, _comparer, token).ConfigureAwait(false);
+                
+                sw.Stop();
+                _logger?.LogInformation("{Producer}: Sorted in {ElapsedMs}ms", producerName, sw.ElapsedMilliseconds);
+                
+                deleteFiles.Add(_fileSystem.DeleteFileAsync(unsortedFilePath, token));
+                await writer.WriteAsync(sortedFilename, token);
+            }
             
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            _logger?.LogInformation("Sorting chunk file: {Filename}", item);
-            var sortedFilename = item.Replace(Constants.UnsortedFileExtension, Constants.SortedFileExtension);
-            var unsortedFilePath = GetFullPath(item);
-            var sortedFilePath = GetFullPath(sortedFilename);
-            await _memoryFileSorter.SortFileAsync(unsortedFilePath, sortedFilePath, _comparer, token).ConfigureAwait(false);
-            sw.Stop();
-            _logger?.LogInformation("Sorted chunk file: {UnsortedFile} -> {SortedFile} in {ElapsedMs}ms", Path.GetFileName(unsortedFilePath), Path.GetFileName(sortedFilePath), sw.ElapsedMilliseconds);
-            
-            // don't have async version
-            deleteFiles.Add(_fileSystem.DeleteFileAsync(unsortedFilePath, token));
-            await writer.WriteAsync(sortedFilename, token);            
+            await Task.WhenAll(deleteFiles).ConfigureAwait(false);
         }
-    
-        await Task.WhenAll(deleteFiles).ConfigureAwait(false);
-     }
+        catch (OperationCanceledException)
+        {
+            // Ensure cleanup happens even on cancellation
+            await Task.WhenAll(deleteFiles).ConfigureAwait(false);
+            throw;
+        }
+    }
 
-    private async Task Consumer(ChannelReader<string> reader, string consumerName, CancellationToken token, Action<string>? onComplete = null)
+    private async Task<string?> Consumer(ChannelReader<string> reader, string consumerName, CancellationToken token)
     {
         var batch = new List<string>();
         var mergeCount = 0;
         
         await foreach (var item in reader.ReadAllAsync(token).ConfigureAwait(false))
         {
+            _logger?.LogInformation("{ConsumerName}: Receiving {item}", consumerName, item);
+
             token.ThrowIfCancellationRequested();
             batch.Add(GetFullPath(item));
             
@@ -188,13 +236,15 @@ public class Sorter
         if (batch.Count == 1)
         {
             _logger?.LogInformation("{ConsumerName}: External sort complete. Final file: {FinalFile}", consumerName, batch[0]);
-            // Invoke the callback with the final file path
-            onComplete?.Invoke(batch[0]);
+            return batch[0];
         }
         else if (batch.Count == 0)
         {
             _logger?.LogWarning("{ConsumerName}: No files to merge", consumerName);
+            return null;
         }
+        
+        return null;
     }
         
     private string GetFullPath(string filename)

@@ -41,8 +41,8 @@ public class SorterBenchmark
         _settings = new ExternalSorterSettings
         {
             TempDirectory = _tempDir,
-            BatchFileSize = 10 * 1024 * 1024, // 10 MB chunks
-            MergeBatch = 10
+            BatchFileSize = 16 * 1024 * 1024, // 10 MB chunks
+            MergeBatch = 64
         };
 
         // Generate 1GB file

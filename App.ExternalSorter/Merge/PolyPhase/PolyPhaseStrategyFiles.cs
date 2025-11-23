@@ -41,47 +41,10 @@ public class PolyPhaseStrategyFiles : IMergeStrategy
         if (runs.Count == 0)
             throw new ArgumentException("At least one input file is required.", nameof(sortedSequences));
 
-        // If we have few enough files, merge them directly
-        if (runs.Count <= _settings.MergeBatch)
-        {
-            return await MergeBatch(runs, comparer, cancellationToken);
-        }
+        if (runs.Count == 1)
+            return runs[0];
 
-        var createdFiles = new List<string>();
-        string? finalFile = null;
-        try
-        {
-            var chunks = runs.Chunk(_settings.MergeBatch);
-            var tasks = new List<Task<string>>();
-            var nextPassFiles = new List<string>();
-
-            foreach (var chunk in chunks)
-            {
-                if (chunk.Length == 1)
-                {
-                    nextPassFiles.Add(chunk[0]);
-                }
-                else
-                {
-                    tasks.Add(MergeBatch(chunk, comparer, cancellationToken));
-                }
-            }
-
-            var results = await Task.WhenAll(tasks);
-            createdFiles.AddRange(results);
-            nextPassFiles.AddRange(results);
-
-            finalFile = await Merge(nextPassFiles, comparer, cancellationToken);
-            return finalFile;
-        }
-        finally
-        {
-            if (createdFiles.Count > 0)
-            {
-                var toDelete = createdFiles.Where(f => f != finalFile);
-                await Task.WhenAll(toDelete.Select(f => _fileSystem.DeleteFileAsync(f, cancellationToken)));
-            }
-        }
+        return await MergeBatch(runs, comparer, cancellationToken);
     }
 
     private async Task<string> MergeBatch(IList<string> runs, IComparer<string> comparer, CancellationToken cancellationToken)
@@ -102,15 +65,15 @@ public class PolyPhaseStrategyFiles : IMergeStrategy
         tape2.AddDummyRuns(dummy);
 
         Tape[] tapes = [tape1, tape2, tape3];
-        var tempFiles = new HashSet<string>();
-        await RunMergePhases(tapes, comparer, tempFiles, cancellationToken);
+        var initialFiles = new HashSet<string>(runs);
+        await RunMergePhases(tapes, initialFiles, comparer, cancellationToken);
 
         // Copy final tape back to caller's array
         var final = tapes[FindNonEmptyTape(tapes)].GetCurrentFilePath();
         return final ?? throw new InvalidOperationException("No output file was produced from merge operation.");
     }
 
-    private async Task RunMergePhases(Tape[] tapes, IComparer<string> comparer, HashSet<string> tempFiles, CancellationToken cancellationToken)
+    private async Task RunMergePhases(Tape[] tapes, HashSet<string> initialFiles, IComparer<string> comparer, CancellationToken cancellationToken)
     {
         int output = FindEmptyTape(tapes); // start with the dummy/empty tape
 
@@ -140,17 +103,12 @@ public class PolyPhaseStrategyFiles : IMergeStrategy
                     context, 
                     cancellationToken);
 
-                if (consumedA != null || consumedB != null)
-                {
-                    tempFiles.Add(outputFile);
-                }
-
-                if (consumedA != null && tempFiles.Remove(consumedA))
+                if (consumedA != null && !initialFiles.Contains(consumedA))
                 {
                     await _fileSystem.DeleteFileAsync(consumedA, cancellationToken);
                 }
 
-                if (consumedB != null && tempFiles.Remove(consumedB))
+                if (consumedB != null && !initialFiles.Contains(consumedB))
                 {
                     await _fileSystem.DeleteFileAsync(consumedB, cancellationToken);
                 }

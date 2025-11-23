@@ -14,7 +14,6 @@ public class MemoryFileSorter
 {
     private readonly IFileSystem _fileSystem;
     private readonly ExternalSorterSettings _settings;
-    private const int MinBufferSize = 65536; // 64KB minimum buffer
     
     /// <summary>
     /// Initializes a new instance of the <see cref="MemoryFileSorter"/> class.
@@ -32,20 +31,24 @@ public class MemoryFileSorter
     /// </summary>
     public async Task SortFileAsync(string unsortedFilePath, string targetPath, IComparer<string> comparer, CancellationToken token)
     {
-        // Step 1: Read lines efficiently using pipelines
-        var allLines = await ReadAllLinesWithPipelineAsync(unsortedFilePath, token);
+        var (lines, count) = await ReadAllLinesWithPipelineAsync(unsortedFilePath, token);
         
-        // Step 2: Sort
-        allLines.Sort(comparer);
-        
-        // Step 3: Write using pipeline writer
-        await WriteLinesWithPipelineAsync(targetPath, allLines, token);
+        try
+        {
+            ThreeWayRadixQuickSort.Sort(lines, 0, count, comparer);
+            await WriteLinesWithPipelineAsync(targetPath, lines, count, token);
+        }
+        finally
+        {
+            ArrayPool<string>.Shared.Return(lines);
+        }
     }
 
-    private async Task<List<string>> ReadAllLinesWithPipelineAsync(string filePath, CancellationToken token)
+    private async Task<(string[] Lines, int Count)> ReadAllLinesWithPipelineAsync(string filePath, CancellationToken token)
     {
         var reader = _fileSystem.FileReader.OpenAsPipeReader(filePath);
-        var allLines = new List<string>();
+        var lines = ArrayPool<string>.Shared.Rent(_settings.InitialLineCapacity);
+        var count = 0;
         var decoder = Encoding.UTF8.GetDecoder();
         
         try
@@ -55,7 +58,7 @@ public class MemoryFileSorter
                 ReadResult result = await reader.ReadAsync(token);
                 ReadOnlySequence<byte> buffer = result.Buffer;
                 
-                ProcessBuffer(ref buffer, allLines, decoder, result.IsCompleted);
+                ProcessBuffer(ref buffer, ref lines, ref count, decoder, result.IsCompleted);
                 
                 reader.AdvanceTo(buffer.Start, buffer.End);
                 
@@ -63,27 +66,41 @@ public class MemoryFileSorter
                     break;
             }
         }
+        catch
+        {
+            ArrayPool<string>.Shared.Return(lines);
+            throw;
+        }
         finally
         {
             await reader.CompleteAsync();
         }
         
-        return allLines;
+        return (lines, count);
     }
     
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void ProcessBuffer(ref ReadOnlySequence<byte> buffer, List<string> lines, 
+    private void ProcessBuffer(ref ReadOnlySequence<byte> buffer, ref string[] lines, ref int count,
         Decoder decoder, bool isCompleted)
     {
         Span<char> stackBuffer = stackalloc char[1024]; // Reusable stack buffer for small lines
         
         while (TryReadLine(ref buffer, out ReadOnlySequence<byte> line))
         {
+            if (count >= lines.Length)
+            {
+                var newSize = lines.Length * 2;
+                var newArray = ArrayPool<string>.Shared.Rent(newSize);
+                lines.AsSpan(0, count).CopyTo(newArray);
+                ArrayPool<string>.Shared.Return(lines);
+                lines = newArray;
+            }
+
             // Use stackalloc for small lines, array pool for large ones
             if (line.Length <= 512)
             {
                 int charCount = GetChars(line, stackBuffer, decoder);
-                lines.Add(new string(stackBuffer.Slice(0, charCount)));
+                lines[count++] = new string(stackBuffer.Slice(0, charCount));
             }
             else
             {
@@ -91,7 +108,7 @@ public class MemoryFileSorter
                 try
                 {
                     int charCount = GetChars(line, charArray, decoder);
-                    lines.Add(new string(charArray, 0, charCount));
+                    lines[count++] = new string(charArray, 0, charCount);
                 }
                 finally
                 {
@@ -139,29 +156,33 @@ public class MemoryFileSorter
         return false;
     }
     
-    private async Task WriteLinesWithPipelineAsync(string targetPath, IEnumerable<string> lines, CancellationToken token)
+    private async Task WriteLinesWithPipelineAsync(string targetPath, string[] lines, int count, CancellationToken token)
     {
         await using var writer = _fileSystem.FileWriter.CreateText(targetPath);
-        var pipe = new Pipe(new PipeOptions(minimumSegmentSize: MinBufferSize, pauseWriterThreshold: MinBufferSize * 4, resumeWriterThreshold: MinBufferSize * 2));
+        var pipe = new Pipe(new PipeOptions(
+            minimumSegmentSize: _settings.PipelineSegmentSize, 
+            pauseWriterThreshold: _settings.PipelinePauseThreshold, 
+            resumeWriterThreshold: _settings.PipelineResumeThreshold));
         
         // Start reader task
         var readerTask = ReadFromPipeAndWriteToStreamAsync(pipe.Reader, writer, token);
         
         // Write to pipe
-        await WriteToPipeAsync(pipe.Writer, lines, token);
+        await WriteToPipeAsync(pipe.Writer, lines, count, token);
         
         // Wait for reader to complete
         await readerTask;
     }
     
-    private async Task WriteToPipeAsync(PipeWriter writer, IEnumerable<string> lines, CancellationToken token)
+    private async Task WriteToPipeAsync(PipeWriter writer, string[] lines, int count, CancellationToken token)
     {
         var newLineBytes = Encoding.UTF8.GetBytes(Environment.NewLine);
         
         try
         {
-            foreach (var line in lines)
+            for (int i = 0; i < count; i++)
             {
+                var line = lines[i];
                 token.ThrowIfCancellationRequested();
                 
                 // Get memory from pipe
@@ -180,7 +201,7 @@ public class MemoryFileSorter
                 writer.Advance(bytesWritten);
                 
                 // Flush periodically to avoid memory pressure
-                if (writer.UnflushedBytes > MinBufferSize)
+                if (writer.UnflushedBytes > _settings.FlushThreshold)
                 {
                     FlushResult result = await writer.FlushAsync(token);
                     if (result.IsCompleted || result.IsCanceled)
@@ -199,7 +220,7 @@ public class MemoryFileSorter
         try
         {
             var decoder = Encoding.UTF8.GetDecoder();
-            var charBuffer = ArrayPool<char>.Shared.Rent(MinBufferSize);
+            var charBuffer = ArrayPool<char>.Shared.Rent(_settings.PipelineSegmentSize);
             
             try
             {

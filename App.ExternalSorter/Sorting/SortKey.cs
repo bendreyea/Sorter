@@ -121,11 +121,19 @@ public readonly struct SortKey : IComparable<SortKey>
                 if (c1Lower == c2Lower)
                 {
                     // Same letter, different case - lowercase comes first
-                    // lowercase has higher ASCII value than uppercase, so invert
+                    // 'a' > 'A', so c1 > c2 means c1 is lowercase
+                    // We want lowercase first, so if c1 > c2, return -1
                     return c2.CompareTo(c1);
                 }
+                
+                // Different letters (should have been caught by case-insensitive check, but just in case)
+                return c1.CompareTo(c2);
             }
         }
+        
+        // If lengths differ, shorter string comes first
+        if (text1.Length != text2.Length)
+            return text1.Length.CompareTo(text2.Length);
 
         // Exact same text (same case), compare by number
         return Number.CompareTo(other.Number);
