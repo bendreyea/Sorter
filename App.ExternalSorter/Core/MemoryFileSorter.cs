@@ -6,7 +6,6 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using Configuration;
 using FileSystem.Interfaces;
-using App.ExternalSorter.Merge.PolyPhase;
 
 /// <summary>
 /// Pipeline-based file sorter.
@@ -16,7 +15,6 @@ public class MemoryFileSorter
     private readonly IFileSystem _fileSystem;
     private readonly ExternalSorterSettings _settings;
     private const int MinBufferSize = 65536; // 64KB minimum buffer
-    private const int BatchSize = 10000; // Number of lines per batch
     
     /// <summary>
     /// Initializes a new instance of the <see cref="MemoryFileSorter"/> class.
@@ -35,24 +33,19 @@ public class MemoryFileSorter
     public async Task SortFileAsync(string unsortedFilePath, string targetPath, IComparer<string> comparer, CancellationToken token)
     {
         // Step 1: Read lines efficiently using pipelines
-        var batches = await ReadBatchesWithPipelineAsync(unsortedFilePath, token);
+        var allLines = await ReadAllLinesWithPipelineAsync(unsortedFilePath, token);
         
-        // Step 2: Sort batches in parallel
-        Parallel.ForEach(batches, batch => Array.Sort(batch, comparer));
+        // Step 2: Sort
+        allLines.Sort(comparer);
         
-        // Step 3: Merge using PolyPhaseStrategy
-        var strategy = new PolyPhaseStrategy<string>();
-        var sortedLines = strategy.Merge(batches, comparer);
-        
-        // Step 4: Write using pipeline writer
-        await WriteLinesWithPipelineAsync(targetPath, sortedLines, token);
+        // Step 3: Write using pipeline writer
+        await WriteLinesWithPipelineAsync(targetPath, allLines, token);
     }
 
-    private async Task<List<string[]>> ReadBatchesWithPipelineAsync(string filePath, CancellationToken token)
+    private async Task<List<string>> ReadAllLinesWithPipelineAsync(string filePath, CancellationToken token)
     {
         var reader = _fileSystem.FileReader.OpenAsPipeReader(filePath);
-        var batches = new List<string[]>();
-        var currentBatch = new List<string>(BatchSize);
+        var allLines = new List<string>();
         var decoder = Encoding.UTF8.GetDecoder();
         
         try
@@ -62,23 +55,12 @@ public class MemoryFileSorter
                 ReadResult result = await reader.ReadAsync(token);
                 ReadOnlySequence<byte> buffer = result.Buffer;
                 
-                ProcessBuffer(ref buffer, currentBatch, decoder, result.IsCompleted);
-                
-                if (currentBatch.Count >= BatchSize)
-                {
-                    batches.Add(currentBatch.ToArray());
-                    currentBatch.Clear();
-                }
+                ProcessBuffer(ref buffer, allLines, decoder, result.IsCompleted);
                 
                 reader.AdvanceTo(buffer.Start, buffer.End);
                 
                 if (result.IsCompleted)
                     break;
-            }
-            
-            if (currentBatch.Count > 0)
-            {
-                batches.Add(currentBatch.ToArray());
             }
         }
         finally
@@ -86,7 +68,7 @@ public class MemoryFileSorter
             await reader.CompleteAsync();
         }
         
-        return batches;
+        return allLines;
     }
     
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
